@@ -1,0 +1,125 @@
+FitModel <- function(NLoops=1, NDegrees=2, plotON=FALSE){
+  fileName <- "./Output/Output.txt"
+  unlink(fileName)
+  EnergyDrivers <- CalculateDrivers()
+  LMData <-data.frame(EnergyDrivers[1:300,], ConsumptionData[1:300,])
+  AllWeekdays <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+  
+  #First, figure out the initial guess of setpoints:
+  EstSPFormula <- as.formula(paste("Consumption",paste(c("DaysInPeriod","Temp","Humidity","WS", AllWeekdays),collapse="+"),sep="~"))
+  EarthModel <- earth(formula=EstSPFormula, LMData, trace=1, nk=20, penalty=3, degree=1,
+                      thresh=0.001, minspan=2, pmethod="backward")
+  Terms <- strsplit(format(EarthModel),"\n")[[1]]
+  #Terms
+  if(plotON){
+    plot(x=LMData$Temp, y=LMData$Consumption, col='red')
+    points(x=LMData$Temp, y=fitted(EarthModel), col='green')
+  }
+  ModelParameters <- ExtractParametersFromEarthModelTerms(Terms)
+  NNLStats <- EvaluateNNLSStats(ModelParameters)
+  writeParametersToFile(fileName, "\nEarth Generated Parameters", NNLStats, ModelParameters)
+
+  # linearize the setpoint parameters into a numeric vector, and call optim with it.
+  PMatrix <- PListToMatrix(ModelParameters)
+  PVector <- as.numeric(PMatrix)
+  PColumnNames <- colnames(PMatrix)
+  OneKPlusIndex <- which(PVector==1000)
+  OneKMinusIndex <- which(PVector==-1000)
+  OtherIndex <- which(PVector<1000 & PVector>-1000)
+  # setting upper and lower bounds on the parameters to be estimated. 1000 is a fixed number.
+  PVector <- PVector[-c(OneKPlusIndex, OneKMinusIndex)]
+  Upper <- PVector * (1.3*(PVector>0)+0.8*(PVector<0))
+  Lower <- PVector * (0.8*(PVector>0)+1.3*(PVector<0))
+  EvaluateCost <- MakeCostFunction(PVector, PColumnNames, OneKPlusIndex, OneKMinusIndex, OtherIndex)
+  
+  EvaluateCost(PVector)
+  
+  Result <<- optim(par=PVector, fn=EvaluateCost, lower=Lower, upper=Upper, method=c("L-BFGS-B"))
+  # now get the optimal parameters and output to file
+  ResultParam <- PVectorToList(Result$par, PColumnNames)
+  ResultStats <- EvaluateNNLSStats(ResultParam)
+  ResultCost <- 1-ResultStats$R2+ResultStats$CV
+  ResultDrivers <- CalculateDrivers(ResultParam)
+  ResultData <-data.frame(ResultDrivers, Consumption = ConsumptionData)
+  ResultFormula <- as.formula(paste("Consumption",paste(colnames(ResultDrivers[,-1]),collapse="+"),sep="~"))
+  HeaderLine <- paste("\n ------Optim Results---- Cost: ", ResultCost, ", Parameters and Stats: -----------", sep="")
+  writeParametersToFile(fileName, HeaderLine, ResultStats, ResultParam)
+  
+  # find if there are any seasonalities:
+#  breakPointModel <- breakpoints(EstSPFormula, data=LMData, breaks=5)
+#  summary(breakPointModel)
+  if(plotON){
+    plot(LMData$Temp, LMData$Consumption, col='red')
+    points(LMData$Temp, NNLStats$prediction, col='purple')
+  }
+  
+  LMData <-data.frame(EnergyDrivers[1:300,-1], Consumption = ConsumptionData$Consumption[1:300])
+  LMMatrix <-data.matrix(subset(LMData,select=-c(Consumption, DayOfWeek)))
+  Result["stats"] <- (PerformNNLS(LMMatrix, LMData$Consumption))
+
+#   InitialParameters <- ModelParameters
+#   InitialStats <- NNLStats
+#   BestParameters <<- ModelParameters
+#   BestStats <<- NNLStats
+#   CurrentParameters <- ModelParameters
+#   writeParametersToFile(fileName, "\nInitial Parameters", InitialStats, InitialParameters)
+  
+  
+#   # brute force parameter optimization
+#   for (iLoop in 1:NLoops){
+#     #vary each of the CDDs +/- NDegrees from the current setpoint, step size 0.5
+#     ThisLoopParameters<-BestParameters
+#     for (iCDD in 1:nCDDs){
+#       MidCDDSPL <- InitialParameters$CDDSPL[iCDD]
+#       for (iSP in 1:(4*NDegrees+1)){
+#         CurrentParameters$CDDSPL[iCDD] <- MidCDDSPL+(iSP-1-2*NDegrees)*0.5
+#         if (iCDD>1){
+#           CurrentParameters$CDDSPH[iCDD-1] <- CurrentParameters$CDDSPL[iCDD]
+#         }
+#         CurrentStats <- EvaluateNNLSStats(CurrentParameters)
+#         if (CurrentStats$R2 > BestStats$R2) {
+#           BestStats<-CurrentStats
+#           BestParameters<-CurrentParameters
+#         }
+#         writeParametersToFile(fileName, "", CurrentStats, CurrentParameters)  
+#       }
+#     }
+#   }
+#   writeParametersToFile(fileName, "Best Parameters", BestStats, BestParameters)
+#   
+}
+MakeCostFunction <- function(PVector, PColumnNames, OneKPlusIndex, OneKMinusIndex, OtherIndex){
+  P <- list()
+  CostFunction <- function(PVector){
+    PVector <- c(PVector, rep(1000,length(OneKPlusIndex)), rep(-1000,length(OneKMinusIndex)))
+    VectorIndex <- c(OtherIndex, OneKPlusIndex, OneKMinusIndex)
+    PVector <- PVector[order(VectorIndex)]
+    P <- PVectorToList(PVector, PColumnNames)
+    ModelStats <- EvaluateNNLSStats(P)
+    cost <- 1-ModelStats$R2+ModelStats$CV
+    #print(cost)
+    return(cost)
+  }
+  return(CostFunction)
+}
+EvaluateNNLSStats <- function(ModelParameters){
+  EnergyDrivers <- CalculateDrivers(ModelParameters)
+  LMData <-data.frame(EnergyDrivers[1:300,-1], Consumption = ConsumptionData$Consumption[1:300])
+  LMMatrix <-data.matrix(subset(LMData,select=-c(Consumption, DayOfWeek)))
+  return(PerformNNLS(LMMatrix, LMData$Consumption))
+}
+PerformNNLS<-function(x, y){
+  model <- nnls(x,y)
+  coefficients <- coef(model)
+  residuals <- model$residuals
+  yMean <- mean(y)
+  SSError <- sum(residuals^2)
+  SSTotal <- sum((y-yMean)^2)
+  R2 <- 1-SSError/SSTotal
+  CV <- sqrt(SSError/(length(y)-sum(coefficients>0)))/yMean
+  modelStats <- list(coefficients=coefficients, 
+                     residuals=residuals, R2=R2, CV=CV,
+                     drivers=colnames(x),
+                     prediction=fitted(model))
+  return(modelStats)                   
+}
